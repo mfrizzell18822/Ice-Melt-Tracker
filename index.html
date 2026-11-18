@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ice Melt Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root { --blue:#0E5A9C; --light:#7FB2DD; --dark:#10202D; --line:#D5DDE4; --bg:#F4F7FA; --mute:#4A5B69; --warn:#B4481A; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:var(--dark); background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:10px 20px; display:flex; gap:20px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; color:var(--blue); }
+  nav button { background:none; border:0; padding:8px 12px; font:inherit; cursor:pointer; color:var(--mute); border-bottom:2px solid transparent; }
+  nav button.on { color:var(--blue); border-color:var(--blue); font-weight:600; }
+  .who { margin-left:auto; color:var(--mute); font-size:13px; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { font-size:12px; color:var(--mute); font-weight:600; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  input, select, button.act { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button.act { background:var(--blue); color:#fff; border-color:var(--blue); cursor:pointer; }
+  button.act.sec { background:#fff; color:var(--blue); }
+  button.act:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+  .row label { display:flex; flex-direction:column; font-size:12px; color:var(--mute); gap:3px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; background:#DCEBF8; color:#0B4A82; }
+  .tag.Transfer { background:#E3EEF9; } .tag.Other { background:#E3E9EE; color:var(--dark); }
+  .tag.st-scheduled { background:#FFF1D6; color:#7A5300; } .tag.st-out, .tag.st-delivered { background:#DDF3E4; color:#1D6B3A; }
+  .tag.st-issue { background:#FBE0D6; color:var(--warn); }
+  .bar { display:flex; height:12px; min-width:2px; border-radius:3px; overflow:hidden; background:#EEF2F5; }
+  .bar i { display:block; height:100%; }
+  .err { color:var(--warn); margin:8px 0; white-space:pre-wrap; }
+  .ok { color:#1D6B3A; margin:8px 0; }
+  .login { max-width:340px; margin:80px auto; }
+  .login .row label { width:100%; }
+  .muted { color:var(--mute); }
+  .hl td { background:#F2F8FD; }
+  .legend { display:flex; gap:14px; font-size:12px; color:var(--mute); margin-bottom:8px; }
+  .legend b { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; }
+  details summary { cursor:pointer; color:var(--blue); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// Public project values. The publishable key is designed to be in browser code; all access is limited by row level security.
+const SUPABASE_URL = "https://lvvebwtgkujxoxwmpmke.supabase.co";
+const SUPABASE_KEY = "sb_publishable_EKKCR6F-Ey1m2hBRbdVgmQ_15vPdO4E";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { db: { schema: "ice_melt" } });
+
+const $app = document.getElementById("app");
+const state = { session:null, profile:null, tab:"board", msg:"", err:"", data:{} };
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const fmt = n => (Math.round(Number(n||0)*10)/10).toString();
+const isMgr = () => state.profile && state.profile.role === "manager";
+const PRODUCTS = { "77102002":"Rock Salt", "77103002":"StormGuard", "77103010":"EcoGuard", "77104001":"Calcium" };
+
+function flash(ok, text){ state.msg = ok ? text : ""; state.err = ok ? "" : text; }
+function errText(e){ return (e && (e.message || e.details)) || String(e); }
+
+async function boot(){
+  const { data } = await sb.auth.getSession();
+  state.session = data.session;
+  sb.auth.onAuthStateChange((_e, s) => { state.session = s; if(!s){ state.profile=null; render(); } });
+  if(state.session) await loadProfile();
+  render();
+}
+async function loadProfile(){
+  const { data, error } = await sb.from("profiles").select("name,role").eq("user_id", state.session.user.id).maybeSingle();
+  state.profile = error ? null : data;
+  if(state.profile) await loadTab();
+}
+
+async function loadTab(){
+  try {
+    if(state.tab === "board"){
+      const r = await sb.from("season_board").select("*").order("seq");
+      if(r.error) throw r.error; state.data.board = r.data;
+    } else if(state.tab === "orders"){
+      const [o, l] = await Promise.all([
+        sb.from("orders").select("id,type,client_name,dest_code,sku,pallets,requested_date,note,created_at,trips(id,seq,pallets,scheduled_date,source_location_id,status,over_limit_reason),order_notes(id,body,created_at)").order("created_at",{ascending:false}).limit(60),
+        sb.from("locations").select("id,code,name,kind,holds_stock,available_as_source").eq("active",true).order("id")
+      ]);
+      if(o.error) throw o.error; if(l.error) throw l.error;
+      state.data.orders = o.data; state.data.locations = l.data;
+    } else if(state.tab === "stock"){
+      const [s, l] = await Promise.all([ sb.from("location_stock").select("*"), sb.from("locations").select("id,code,name,kind,holds_stock,preseason_only,available_as_source").eq("holds_stock",true).order("id") ]);
+      if(s.error) throw s.error; if(l.error) throw l.error;
+      state.data.stock = s.data; state.data.locations = l.data;
+    } else if(state.tab === "audit"){
+      const a = await sb.from("audit_items").select("id,kind,detail,status,created_at,trip_id").order("created_at",{ascending:false}).limit(100);
+      if(a.error) throw a.error; state.data.audit = a.data;
+    }
+  } catch(e){ flash(false, errText(e)); }
+}
+async function go(tab){ state.tab = tab; state.msg = state.err = ""; await loadTab(); render(); }
+
+function render(){
+  if(!state.session){ $app.innerHTML = loginView(); wireLogin(); return; }
+  if(!state.profile){
+    $app.innerHTML = `<div class="login card"><h2>Waiting for access</h2><p class="muted">You are signed in as ${esc(state.session.user.email)}, but no role has been assigned yet. Ask the manager to give you access.</p><button class="act sec" id="out">Sign out</button></div>`;
+    document.getElementById("out").onclick = () => sb.auth.signOut(); return;
+  }
+  const tabs = [["board","Season board"],["orders","Orders and schedule"],["stock","Stock"]].concat(isMgr()?[["audit","Audit"]]:[]);
+  $app.innerHTML = `<header><h1>Ice Melt Tracker</h1><nav>${tabs.map(t=>`<button data-t="${t[0]}" class="${state.tab===t[0]?"on":""}">${t[1]}</button>`).join("")}</nav>
+    <span class="who">${esc(state.profile.name)} (${state.profile.role}) · <a href="#" id="out">Sign out</a></span></header>
+    <main>${state.err?`<div class="err">${esc(state.err)}</div>`:""}${state.msg?`<div class="ok">${esc(state.msg)}</div>`:""}${view()}</main>`;
+  document.querySelectorAll("nav button").forEach(b => b.onclick = () => go(b.dataset.t));
+  document.getElementById("out").onclick = e => { e.preventDefault(); sb.auth.signOut(); };
+  wireView();
+}
+
+function loginView(){
+  return `<div class="login card"><h2>Ice Melt Tracker</h2><div class="row"><label>Email<input id="em" type="email" autocomplete="username"></label><label>Password<input id="pw" type="password" autocomplete="current-password"></label></div>
+  ${state.err?`<div class="err">${esc(state.err)}</div>`:""}${state.msg?`<div class="ok">${esc(state.msg)}</div>`:""}
+  <div class="row" style="margin-top:12px"><button class="act" id="in">Sign in</button><button class="act sec" id="up">Create account</button></div>
+  <p class="muted" style="font-size:12px">A new account can see nothing until the manager assigns a role.</p></div>`;
+}
+function wireLogin(){
+  const creds = () => ({ email: document.getElementById("em").value.trim(), password: document.getElementById("pw").value });
+  document.getElementById("in").onclick = async () => {
+    const { error } = await sb.auth.signInWithPassword(creds());
+    if(error){ flash(false, error.message); return render(); }
+    const { data } = await sb.auth.getSession(); state.session = data.session; state.err = ""; await loadProfile(); render();
+  };
+  document.getElementById("up").onclick = async () => {
+    const { error } = await sb.auth.signUp(creds());
+    flash(!error, error ? error.message : "Account created. Check your email if a confirmation is required, then sign in."); render();
+  };
+}
+
+function view(){
+  if(state.tab==="board") return boardView();
+  if(state.tab==="orders") return ordersView();
+  if(state.tab==="stock") return stockView();
+  if(state.tab==="audit") return auditView();
+  return "";
+}
+
+// ---------- Season board ----------
+function boardView(){
+  const rows = state.data.board || [];
+  const t26 = r => Number(r.y2026_customer)+Number(r.y2026_transfer)+Number(r.y2026_other);
+  const max = Math.max(1, ...rows.map(r => Math.max(t26(r), Number(r.y2025||0), Number(r.y2024||0))));
+  const sum = f => rows.reduce((a,r)=>a+Number(f(r)||0),0);
+  const w = v => (Number(v)/max*100).toFixed(1)+"%";
+  return `<div class="card"><h2>Pallets sent out of 822 by fiscal week</h2>
+  <div class="legend"><span><b style="background:#0E5A9C"></b>2026 Customer</span><span><b style="background:#7FB2DD"></b>2026 Transfer</span><span><b style="background:#10202D"></b>2026 Other</span><span><b style="background:#C9D3DC"></b>2025</span><span><b style="background:#E3E9EE;border:1px solid #C9D3DC"></b>2024</span></div>
+  <table><thead><tr><th>FW</th><th style="width:34%">2026 vs prior years</th><th class="n">2026</th><th class="n">Customer</th><th class="n">Transfer</th><th class="n">Other</th><th class="n">2025</th><th class="n">2024</th></tr></thead><tbody>
+  ${rows.map(r=>`<tr><td>${r.fiscal_week}</td><td>
+     <div class="bar"><i style="width:${w(r.y2026_customer)};background:#0E5A9C"></i><i style="width:${w(r.y2026_transfer)};background:#7FB2DD"></i><i style="width:${w(r.y2026_other)};background:#10202D"></i></div>
+     <div class="bar" style="margin-top:2px"><i style="width:${w(r.y2025||0)};background:#C9D3DC"></i></div>
+     <div class="bar" style="margin-top:2px"><i style="width:${w(r.y2024||0)};background:#E3E9EE;box-shadow:inset 0 0 0 1px #C9D3DC"></i></div></td>
+     <td class="n"><b>${fmt(t26(r))}</b></td><td class="n">${fmt(r.y2026_customer)}</td><td class="n">${fmt(r.y2026_transfer)}</td><td class="n">${fmt(r.y2026_other)}</td><td class="n">${fmt(r.y2025)}</td><td class="n">${fmt(r.y2024)}</td></tr>`).join("")}
+  </tbody><tfoot><tr><th>Season</th><th></th><th class="n">${fmt(sum(t26))}</th><th class="n">${fmt(sum(r=>r.y2026_customer))}</th><th class="n">${fmt(sum(r=>r.y2026_transfer))}</th><th class="n">${fmt(sum(r=>r.y2026_other))}</th><th class="n">${fmt(sum(r=>r.y2025))}</th><th class="n">${fmt(sum(r=>r.y2024))}</th></tr></tfoot></table>
+  <p class="muted" style="font-size:12px">2026 counts trips that have gone out or been delivered from 822, including transfers. 2025 and 2024 are the typed weekly totals from the workbook (no type split).</p></div>`;
+}
+
+// ---------- Orders ----------
+function locOptions(sel){ return (state.data.locations||[]).filter(l=>l.kind!=="destination"&&l.kind!=="hub").map(l=>`<option value="${l.id}" ${l.id==sel?"selected":""}>${esc(l.code)}${l.available_as_source===false?" (source off)":""}</option>`).join(""); }
+function ordersView(){
+  const orders = state.data.orders || [];
+  const locs = state.data.locations || [];
+  const code = id => (locs.find(l=>l.id===id)||{}).code || "";
+  const form = isMgr() ? `<div class="card"><h2>New order</h2><div class="row">
+    <label>Type<select id="o_type"><option>Customer</option><option>Transfer</option><option>Other</option></select></label>
+    <label>Client or destination<input id="o_client" placeholder="Name"></label>
+    <label>Destination code<input id="o_dest" size="8" placeholder="e.g. 539"></label>
+    <label>Product<select id="o_sku">${Object.entries(PRODUCTS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select></label>
+    <label>Pallets<input id="o_pal" type="number" step="0.5" min="0.5" size="4" style="width:80px"></label>
+    <label>Requested date<input id="o_date" type="date"></label>
+    <label>Note<input id="o_note" placeholder="Required for Other"></label>
+    <button class="act" id="o_add">Add order</button></div>
+    <p class="muted" style="font-size:12px">Orders over 4 pallets are split into trips of 4 or fewer automatically.</p></div>` : "";
+  return form + `<div class="card"><h2>Orders and trips</h2>${orders.length?"":'<p class="muted">No orders yet.</p>'}
+  ${orders.map(o=>`<div style="border-top:1px solid var(--line);padding:10px 0">
+    <div><span class="tag ${o.type}">${o.type}</span> <b>${esc(o.client_name||"(no name)")}</b> · ${esc(PRODUCTS[o.sku]||o.sku)} · ${fmt(o.pallets)} pallets${o.dest_code?` · to ${esc(o.dest_code)}`:""}${o.requested_date?` · wanted ${o.requested_date}`:""}${o.note?` <span class="muted">· ${esc(o.note)}</span>`:""}</div>
+    <table style="margin-top:6px"><tbody>${(o.trips||[]).sort((a,b)=>a.seq-b.seq).map(t=>`<tr>
+      <td style="width:60px">Trip ${t.seq}</td><td style="width:80px">${fmt(t.pallets)} pal${t.over_limit_reason?" ⚠":""}</td>
+      <td><span class="tag st-${t.status}">${t.status}</span></td>
+      <td>${isMgr() ? `<input type="date" id="d_${t.id}" value="${t.scheduled_date||""}"> <select id="s_${t.id}">${locOptions(t.source_location_id)}</select> <input id="r_${t.id}" placeholder="Override reason (if needed)" size="22">
+        <button class="act" data-assign="${t.id}">Assign</button>
+        ${t.status==="scheduled"?`<button class="act sec" data-status="out" data-trip="${t.id}">Out</button>`:""}
+        ${t.status==="out"?`<button class="act sec" data-status="delivered" data-trip="${t.id}">Delivered</button>`:""}`
+        : `${t.scheduled_date||"not scheduled"} ${t.source_location_id?"from "+esc(code(t.source_location_id)):""}`}</td></tr>`).join("")}</tbody></table>
+    <details><summary>Notes (${(o.order_notes||[]).length})</summary>
+      ${(o.order_notes||[]).map(n=>`<div class="muted">${esc(n.created_at.slice(0,10))}: ${esc(n.body)}</div>`).join("")}
+      <div class="row" style="margin-top:6px"><input id="n_${o.id}" placeholder="Add a note" size="40"><button class="act sec" data-note="${o.id}">Add</button></div></details></div>`).join("")}</div>`;
+}
+
+// ---------- Stock ----------
+function stockView(){
+  const locs = state.data.locations || [], stock = state.data.stock || [];
+  const g = (l,s) => (stock.find(x=>x.location_id===l&&x.sku===s)||{on_hand:0}).on_hand;
+  const form = isMgr() ? `<div class="card"><h2>Add stock entry</h2><div class="row">
+    <label>Location<select id="k_loc">${locs.map(l=>`<option value="${l.id}">${esc(l.code)}</option>`).join("")}</select></label>
+    <label>Product<select id="k_sku">${Object.entries(PRODUCTS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select></label>
+    <label>Kind<select id="k_type"><option value="opening">Opening stock</option><option value="receipt">Receipt (inbound)</option></select></label>
+    <label>Pallets<input id="k_pal" type="number" step="0.5" min="0.5" style="width:90px"></label>
+    <label>Note<input id="k_note" size="24"></label><button class="act" id="k_add">Add entry</button></div>
+    <p class="muted" style="font-size:12px">Stock is a ledger: entries are added, never edited. Counts and adjustments come in the next slice.</p></div>` : "";
+  return form + `<div class="card"><h2>On hand (pallets)</h2><table><thead><tr><th>Location</th>${Object.values(PRODUCTS).map(p=>`<th class="n">${p}</th>`).join("")}<th></th></tr></thead><tbody>
+  ${locs.map(l=>`<tr><td><b>${esc(l.code)}</b> <span class="muted">${esc(l.name)}</span></td>${Object.keys(PRODUCTS).map(s=>`<td class="n">${fmt(g(l.id,s))}</td>`).join("")}
+  <td>${l.preseason_only?'<span class="tag Other">Preseason only</span> ':""}${l.kind==="store"&&!l.available_as_source?'<span class="tag st-issue">Not a source</span>':""}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+// ---------- Audit ----------
+function auditView(){
+  const a = state.data.audit || [];
+  return `<div class="card"><h2>Audit</h2>${a.length?"":'<p class="muted">Nothing to review.</p>'}<table><thead><tr><th>Date</th><th>Kind</th><th>Detail</th><th>Status</th></tr></thead><tbody>
+  ${a.map(x=>`<tr><td>${x.created_at.slice(0,10)}</td><td>${esc(x.kind.replace(/_/g," "))}</td><td>${esc(x.detail||"")}</td><td>${esc(x.status)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+// ---------- actions ----------
+const val = id => document.getElementById(id).value;
+async function run(fn, okText){
+  try { await fn(); flash(true, okText); } catch(e){ flash(false, errText(e)); }
+  await loadTab(); render();
+}
+function wireView(){
+  const add = document.getElementById("o_add");
+  if(add) add.onclick = () => run(async () => {
+    const season = await sb.from("seasons").select("id").eq("active",true).limit(1).single(); if(season.error) throw season.error;
+    const dest = val("o_dest").trim();
+    const destLoc = dest ? (state.data.locations||[]).find(l=>l.code===dest) : null;
+    const r = await sb.rpc("create_order", { p_season:season.data.id, p_type:val("o_type"), p_client:val("o_client")||null, p_commercial_id:null,
+      p_dest_code:dest||null, p_address:null, p_sku:val("o_sku"), p_pallets:Number(val("o_pal")), p_requested:val("o_date")||null, p_note:val("o_note")||null, p_dest_location:destLoc?destLoc.id:null });
+    if(r.error) throw r.error;
+  }, "Order added and split into trips.");
+  document.querySelectorAll("[data-assign]").forEach(b => b.onclick = () => run(async () => {
+    const id = b.dataset.assign;
+    if(!val("d_"+id)) throw new Error("Pick a date first.");
+    const r = await sb.rpc("assign_trip", { p_trip:id, p_date:val("d_"+id), p_source:Number(val("s_"+id)), p_reason:val("r_"+id)||null });
+    if(r.error) throw r.error;
+  }, "Trip scheduled."));
+  document.querySelectorAll("[data-status]").forEach(b => b.onclick = () => run(async () => {
+    const r = await sb.rpc("set_trip_status", { p_trip:b.dataset.trip, p_status:b.dataset.status, p_issue:null }); if(r.error) throw r.error;
+  }, "Trip updated."));
+  document.querySelectorAll("[data-note]").forEach(b => b.onclick = () => run(async () => {
+    const body = val("n_"+b.dataset.note).trim(); if(!body) throw new Error("Write a note first.");
+    const r = await sb.from("order_notes").insert({ order_id:b.dataset.note, body }); if(r.error) throw r.error;
+  }, "Note added."));
+  const k = document.getElementById("k_add");
+  if(k) k.onclick = () => run(async () => {
+    const r = await sb.from("stock_ledger").insert({ location_id:Number(val("k_loc")), sku:val("k_sku"), entry_type:val("k_type"), pallets:Number(val("k_pal")), note:val("k_note")||null });
+    if(r.error) throw r.error;
+  }, "Stock entry added.");
+}
+boot();
+</script>
+</body>
+</html>
